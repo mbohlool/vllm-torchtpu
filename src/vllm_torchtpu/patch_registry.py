@@ -49,6 +49,11 @@ _ENGINE: tuple[Stage, ...] = (*_ACTIVE, "engine_core")
 PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering", ("import",)),
+    # vLLM-Omni's API server imports torchaudio at module import; only the
+    # import stage is guaranteed to run before that in every process. A no-op
+    # unless vllm_omni is installed and torchaudio is not. Lives outside
+    # vllm_torchtpu.omni because that package imports JAX on import.
+    Patch("vllm_torchtpu.torchaudio_shim:install_torchaudio_shim", ("import",)),
     # TODO(https://github.com/vllm-project/vllm-torchtpu/pull/1182): Remove
     # this patch once the pinned TorchTPU supports tuple-axis PartitionSpecs
     # in both get_global_shape and get_local_shape.
