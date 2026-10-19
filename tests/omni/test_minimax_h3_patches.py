@@ -3,10 +3,13 @@
 
 Distributed tests run a real 2-process gloo group. The pipeline under test is
 a stand-in module exposing the attributes the patches replace, so these tests
-never import vLLM-Omni or MiniMax-H3 code.
+never import MiniMax-H3 code. Only the indexed-modulation reference check
+loads vLLM-Omni's indexed_modulation.py from sys.path by file location, since
+tests/omni/mock_omni.py replaces the vllm_omni package (skipped if absent).
 """
 
 import importlib.util
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -607,6 +610,7 @@ def test_async_output_loop_device(
 def test_minimax_h3_patches_idempotent(monkeypatch):
     pipeline = _fake_pipeline_module(None, None, 0, 1)
     monkeypatch.setitem(sys.modules, minimax_h3.PIPELINE_MODULE, pipeline)
+    modulation, transformer, _ = _fake_indexed_modulation(monkeypatch)
 
     def patched_state():
         return (
@@ -614,6 +618,8 @@ def test_minimax_h3_patches_idempotent(monkeypatch):
             pipeline.dist,
             pipeline.MiniMaxH3Pipeline._encoder_group_broadcast_tensor,
             pipeline.MiniMaxH3Pipeline._distribute_encode_inputs,
+            *(getattr(modulation, name) for name in _INDEXED_NAMES),
+            *(getattr(transformer, name) for name in _INDEXED_NAMES),
         )
 
     assert minimax_h3.apply_minimax_h3_patches()
@@ -636,7 +642,11 @@ def test_patches_noop_without_vllm_omni(monkeypatch):
 def test_patches_skip_modules_that_are_not_loaded(monkeypatch):
     # apply_omni_model_specific_patches runs for every Omni model: MiniMax-H3
     # modules that are not already loaded must not be imported.
-    h3_names = (minimax_h3.PIPELINE_MODULE,)
+    h3_names = (
+        minimax_h3.PIPELINE_MODULE,
+        minimax_h3.INDEXED_MODULATION_MODULE,
+        *minimax_h3.INDEXED_MODULATION_IMPORTERS,
+    )
     for name in h3_names:
         monkeypatch.delitem(sys.modules, name, raising=False)
     import_module = importlib.import_module
@@ -647,4 +657,219 @@ def test_patches_skip_modules_that_are_not_loaded(monkeypatch):
 
     monkeypatch.setattr(importlib, "import_module", guarded_import)
     assert minimax_h3.apply_minimax_h3_patches() is False
+    assert minimax_h3.patch_indexed_modulation() is False
     assert all(name not in sys.modules for name in h3_names)
+
+    # A loaded indexed_modulation is patched; an importer that is not loaded
+    # is skipped rather than imported.
+    modulation, transformer, _ = _fake_indexed_modulation(monkeypatch)
+    monkeypatch.delitem(sys.modules, transformer.__name__)
+    assert minimax_h3.patch_indexed_modulation()
+    assert transformer.__name__ not in sys.modules
+    assert modulation.indexed_gate is not transformer.indexed_gate
+
+
+# -----------------------------------------------------------------------------
+# (f) indexed modulation PyTorch reference
+# -----------------------------------------------------------------------------
+
+_INDEXED_NAMES = tuple(name for name, _, _ in minimax_h3.INDEXED_MODULATION_FUNCTIONS)
+_UPSTREAM = object()
+_EPS = 1e-6
+
+
+def _fake_indexed_modulation(monkeypatch):
+    """Stand-ins for indexed_modulation and the transformer importing from it."""
+    calls = []
+    modulation = types.ModuleType(minimax_h3.INDEXED_MODULATION_MODULE)
+    for name in _INDEXED_NAMES:
+
+        def original(*args, _name=name, **kwargs):
+            calls.append(_name)
+            return _UPSTREAM
+
+        original.__name__ = name
+        setattr(modulation, name, original)
+    transformer = types.ModuleType(minimax_h3.INDEXED_MODULATION_IMPORTERS[0])
+    for name in _INDEXED_NAMES:
+        setattr(transformer, name, getattr(modulation, name))
+    for module in (modulation, transformer):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    return modulation, transformer, calls
+
+
+def _modulation_inputs(
+    dtype, mod_dtype, *, rows=333, hidden=1280, mod_rows=6, device=_CPU
+):
+    """AdaLN inputs of one DiT block: ``rows`` packed tokens, ``mod_rows``
+    (requests x modalities) modulation rows and per-token ``indices``
+    (combined_indices) selecting a modulation row."""
+    gen = torch.Generator().manual_seed(0)
+
+    def randn(*shape, dt, std=1.0, mean=0.0):
+        return (torch.randn(*shape, generator=gen) * std + mean).to(dt).to(device)
+
+    return SimpleNamespace(
+        x=randn(rows, hidden, dt=dtype, std=2.0),
+        branch=randn(rows, hidden, dt=dtype),
+        weight=randn(hidden, dt=dtype, std=0.1, mean=1.0),
+        shift=randn(mod_rows, hidden, dt=mod_dtype, std=0.5),
+        scale=randn(mod_rows, hidden, dt=mod_dtype, std=0.1),
+        gate=randn(mod_rows, hidden, dt=mod_dtype, std=0.5),
+        indices=torch.randint(0, mod_rows, (rows,), generator=gen).to(device),
+    )
+
+
+def _indexed_args(name, a):
+    return {
+        "indexed_scale_shift_": lambda: (a.x.clone(), a.shift, a.scale, a.indices),
+        "indexed_gate": lambda: (a.x, a.gate, a.branch, a.indices),
+        "rms_norm_indexed_scale_shift": lambda: (
+            a.x,
+            a.weight,
+            a.shift,
+            a.scale,
+            a.indices,
+            _EPS,
+        ),
+        "indexed_gate_rms_norm_scale_shift": lambda: (
+            a.x,
+            a.gate,
+            a.branch,
+            a.weight,
+            a.shift,
+            a.scale,
+            a.indices,
+            _EPS,
+        ),
+    }[name]()
+
+
+def _as_tuple(out):
+    return out if isinstance(out, tuple) else (out,)
+
+
+@pytest.fixture(scope="module")
+def upstream_indexed_modulation():
+    """vLLM-Omni's indexed_modulation.py, loaded by path under a private name.
+
+    tests/omni/mock_omni.py replaces ``vllm_omni`` in ``sys.modules`` with a
+    MagicMock, so the module cannot be imported by name here. It only imports
+    torch and vllm.triton_utils, and is not registered in ``sys.modules``.
+    """
+    relative = os.path.join("vllm_omni", "diffusion", "layers", "indexed_modulation.py")
+    for entry in sys.path:
+        path = os.path.join(entry or os.getcwd(), relative)
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location(
+                "_upstream_indexed_modulation", path
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    pytest.skip(f"{relative} not found on sys.path")
+
+
+@pytest.mark.parametrize(
+    ("dtype", "mod_dtype"),
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+@pytest.mark.parametrize("hidden", [1280, 5120])
+def test_indexed_modulation_reference_matches_upstream_cpu(
+    upstream_indexed_modulation, dtype, mod_dtype, hidden
+):
+    upstream = upstream_indexed_modulation
+    inputs = _modulation_inputs(dtype, mod_dtype, hidden=hidden)
+    for name, reference, _ in minimax_h3.INDEXED_MODULATION_FUNCTIONS:
+        original = getattr(upstream, name)
+        expected = _as_tuple(original(*_indexed_args(name, inputs)))
+        args = _indexed_args(name, inputs)
+        actual = _as_tuple(reference(*args))
+        if name == "indexed_scale_shift_":
+            assert actual[0] is args[0]  # in place, like upstream
+        assert len(actual) == len(expected)
+        for out, ref in zip(actual, expected):
+            assert out.dtype == dtype
+            _assert_same(out, ref)
+            assert not torch.equal(out, inputs.x)
+
+
+def test_indexed_modulation_dispatch(monkeypatch):
+    triton_utils = pytest.importorskip("vllm.triton_utils")
+    modulation, _, calls = _fake_indexed_modulation(monkeypatch)
+    assert minimax_h3.patch_indexed_modulation()
+    meta = _modulation_inputs(
+        torch.bfloat16, torch.float32, device=torch.device("meta")
+    )
+
+    # No Triton and a non-CPU tensor: the reference runs, never upstream.
+    monkeypatch.setattr(triton_utils, "HAS_TRITON", False)
+    for name in _INDEXED_NAMES:
+        for out in _as_tuple(getattr(modulation, name)(*_indexed_args(name, meta))):
+            assert out.device.type == "meta"
+            assert out.shape == meta.x.shape
+            assert out.dtype == torch.bfloat16
+    out = modulation.indexed_gate(
+        x=meta.x, gate=meta.gate, other=meta.branch, indices=meta.indices
+    )
+    assert out.device.type == "meta"
+    assert calls == []
+
+    # Triton on a non-TPU device, and CPU tensors: the upstream function.
+    monkeypatch.setattr(triton_utils, "HAS_TRITON", True)
+    assert modulation.indexed_gate(*_indexed_args("indexed_gate", meta)) is _UPSTREAM
+    monkeypatch.setattr(triton_utils, "HAS_TRITON", False)
+    cpu = _modulation_inputs(torch.bfloat16, torch.bfloat16, rows=4, hidden=8)
+    assert modulation.indexed_gate(*_indexed_args("indexed_gate", cpu)) is _UPSTREAM
+    assert calls == ["indexed_gate", "indexed_gate"]
+
+    # TPU tensors take the reference even if vLLM found Triton.
+    monkeypatch.setattr(triton_utils, "HAS_TRITON", True)
+    tpu = SimpleNamespace(is_cpu=False, device=SimpleNamespace(type="tpu"))
+    assert not minimax_h3.upstream_handles_device(tpu)
+
+
+def test_indexed_modulation_rebinds_importers(monkeypatch):
+    modulation, transformer, _ = _fake_indexed_modulation(monkeypatch)
+    originals = {name: getattr(modulation, name) for name in _INDEXED_NAMES}
+    other = types.ModuleType("vllm_omni.fake_other_importer")
+    other.indexed_scale_shift_ = originals["indexed_scale_shift_"]
+    other.indexed_gate = "unrelated"
+    monkeypatch.setitem(sys.modules, other.__name__, other)
+
+    assert minimax_h3.patch_indexed_modulation()
+    for name, reference, _ in minimax_h3.INDEXED_MODULATION_FUNCTIONS:
+        wrapper = getattr(modulation, name)
+        assert wrapper is not originals[name]
+        assert getattr(modulation, f"_tpu_orig_{name}") is originals[name]
+        assert wrapper.__wrapped__ is originals[name]
+        assert wrapper._tpu_reference is reference
+        assert getattr(transformer, name) is wrapper
+    assert other.indexed_scale_shift_ is modulation.indexed_scale_shift_
+    assert other.indexed_gate == "unrelated"
+
+
+def test_indexed_modulation_patch_idempotent(monkeypatch):
+    modulation, transformer, _ = _fake_indexed_modulation(monkeypatch)
+    assert minimax_h3.patch_indexed_modulation()
+    modules = (modulation, transformer)
+    state = [getattr(m, name) for m in modules for name in _INDEXED_NAMES]
+    assert not minimax_h3.patch_indexed_modulation()
+    assert state == [getattr(m, name) for m in modules for name in _INDEXED_NAMES]
+
+    # A module that bound an original later is rebound, without re-wrapping.
+    late = types.ModuleType("vllm_omni.fake_late_importer")
+    late.indexed_gate = modulation._tpu_orig_indexed_gate
+    monkeypatch.setitem(sys.modules, late.__name__, late)
+    assert minimax_h3.patch_indexed_modulation()
+    assert late.indexed_gate is modulation.indexed_gate is state[1]
+    assert modulation.indexed_gate.__wrapped__ is modulation._tpu_orig_indexed_gate
+
+
+def test_indexed_modulation_noop_without_module(monkeypatch):
+    monkeypatch.setitem(sys.modules, minimax_h3.INDEXED_MODULATION_MODULE, None)
+    assert minimax_h3.patch_indexed_modulation() is False

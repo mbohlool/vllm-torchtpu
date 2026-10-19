@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU patches for the vLLM-Omni MiniMax-H3 pipeline.
 
-The pipeline's hand-rolled tensor broadcasts and object collectives do not
-run on torch_tpu as written upstream; the patches here replace them.
+The patches replace the pipeline's hand-rolled broadcasts and object
+collectives and the Triton-only indexed-modulation kernels, none of which
+run on torch_tpu as written upstream.
 
 Each patch carries its rationale in a comment block at its entry point.
 Patches only touch modules that are already loaded, do nothing without
@@ -10,6 +11,7 @@ vLLM-Omni or the MiniMax-H3 pipeline, and applying them twice changes
 nothing.
 """
 
+import functools
 import pickle
 import sys
 from collections.abc import Callable, Sequence
@@ -23,6 +25,11 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 PIPELINE_MODULE = "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3"
+INDEXED_MODULATION_MODULE = "vllm_omni.diffusion.layers.indexed_modulation"
+# Modules that bind the indexed-modulation functions by name at import time.
+INDEXED_MODULATION_IMPORTERS = (
+    "vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer",
+)
 
 # Header lengths of the upstream shape tensors (ndim + up to N-1 dims).
 DIT_META_LEN = 5  # pipeline_minimax_h3._broadcast_tensor: torch.zeros(5)
@@ -519,6 +526,201 @@ def patch_pipeline_object_collectives(pipeline: Any) -> bool:
     return True
 
 
+# -----------------------------------------------------------------------------
+# Indexed modulation (DiT AdaLN) PyTorch reference.
+# -----------------------------------------------------------------------------
+
+
+def indexed_scale_shift_reference(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Upstream CPU path of ``indexed_scale_shift_`` (updates ``x`` in place)."""
+    x.copy_(
+        (
+            x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
+        ).to(x.dtype)
+    )
+    return x
+
+
+def indexed_gate_reference(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Upstream CPU path of ``indexed_gate``."""
+    return (x + gate.index_select(0, indices) * other).to(x.dtype)
+
+
+def rms_norm_indexed_scale_shift_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Upstream CPU path of ``rms_norm_indexed_scale_shift``."""
+    input_dtype = x.dtype
+    normalized = x.float()
+    variance = normalized.pow(2).mean(-1, keepdim=True)
+    normalized = normalized * torch.rsqrt(variance + eps)
+    normalized = (weight.float() * normalized).to(input_dtype)
+    return (
+        normalized * (1.0 + scale.index_select(0, indices))
+        + shift.index_select(0, indices)
+    ).to(input_dtype)
+
+
+def indexed_gate_rms_norm_scale_shift_reference(
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    branch: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Upstream CPU path of ``indexed_gate_rms_norm_scale_shift``."""
+    input_dtype = residual.dtype
+    residual_out = (residual + gate.index_select(0, indices) * branch).to(input_dtype)
+    normalized = residual_out.float()
+    variance = normalized.pow(2).mean(-1, keepdim=True)
+    normalized = normalized * torch.rsqrt(variance + eps)
+    normalized = (weight.float() * normalized).to(input_dtype)
+    modulated_out = (
+        normalized * (1.0 + scale.index_select(0, indices))
+        + shift.index_select(0, indices)
+    ).to(input_dtype)
+    return residual_out, modulated_out
+
+
+# (public name, PyTorch reference, name of the tensor upstream dispatches on)
+INDEXED_MODULATION_FUNCTIONS = (
+    ("indexed_scale_shift_", indexed_scale_shift_reference, "x"),
+    ("indexed_gate", indexed_gate_reference, "x"),
+    ("rms_norm_indexed_scale_shift", rms_norm_indexed_scale_shift_reference, "x"),
+    (
+        "indexed_gate_rms_norm_scale_shift",
+        indexed_gate_rms_norm_scale_shift_reference,
+        "residual",
+    ),
+)
+
+
+def _triton_available() -> bool:
+    try:
+        from vllm.triton_utils import HAS_TRITON
+    except ImportError:
+        return False
+    return bool(HAS_TRITON)
+
+
+def upstream_handles_device(tensor: torch.Tensor) -> bool:
+    """Whether upstream indexed modulation can run on ``tensor``'s device.
+
+    True on CPU (upstream's own PyTorch path) and on non-TPU devices when
+    vLLM found Triton.
+    """
+    if tensor.is_cpu:
+        return True
+    return tensor.device.type != "tpu" and _triton_available()
+
+
+def _indexed_modulation_wrapper(
+    original: Callable[..., Any],
+    reference: Callable[..., Any],
+    dispatch_arg: str,
+) -> Callable[..., Any]:
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        tensor = args[0] if args else kwargs[dispatch_arg]
+        if upstream_handles_device(tensor):
+            return original(*args, **kwargs)
+        return reference(*args, **kwargs)
+
+    wrapper._tpu_reference = reference
+    return wrapper
+
+
+def patch_indexed_modulation() -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: vllm_omni/diffusion/layers/indexed_modulation.py (vllm-omni
+    # e1d77a3) does `from vllm.triton_utils import tl, triton`, which is
+    # vLLM's TritonPlaceholder when Triton is unavailable. Its four public
+    # functions (indexed_scale_shift_, indexed_gate,
+    # rms_norm_indexed_scale_shift, indexed_gate_rms_norm_scale_shift) take
+    # their PyTorch reference only under `if x.is_cpu:` / `if
+    # residual.is_cpu:` and otherwise launch Triton kernels.
+    #
+    # Problem on TPU: the first DiT block failed at
+    # minimax_h3_transformer.py:1059 -> indexed_modulation.py:278 with
+    # "AttributeError: module 'triton' has no attribute 'next_power_of_2'".
+    #
+    # Fix: each function is wrapped. CPU tensors and Triton-capable devices
+    # call the original; other devices (TPU) run a copy of upstream's CPU
+    # path, expression by expression. minimax_h3_transformer binds the four
+    # names at import (:49-54), so they are rebound there and in every
+    # loaded vllm_omni module that holds an original. teacache/extractors.py
+    # :1382 imports indexed_scale_shift_ at call time and gets the wrapper.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once upstream indexed_modulation selects its PyTorch reference
+    # path whenever Triton is unavailable (e.g. on HAS_TRITON / device
+    # support) instead of checking `is_cpu`.
+    # -------------------------------------------------------------------------
+    module = sys.modules.get(INDEXED_MODULATION_MODULE)
+    if module is None:
+        logger.debug(
+            "Skipping indexed modulation TPU patch: %s is not loaded.",
+            INDEXED_MODULATION_MODULE,
+        )
+        return False
+    importers = [
+        loaded
+        for loaded in (sys.modules.get(name) for name in INDEXED_MODULATION_IMPORTERS)
+        if loaded is not None
+    ]
+    importers.extend(
+        loaded
+        for loaded_name, loaded in list(sys.modules.items())
+        if loaded_name.startswith("vllm_omni.")
+        and loaded is not None
+        and loaded is not module
+        and all(loaded is not importer for importer in importers)
+    )
+    changed = False
+    for name, reference, dispatch_arg in INDEXED_MODULATION_FUNCTIONS:
+        marker = f"_tpu_orig_{name}"
+        original = getattr(module, marker, None)
+        if original is None:
+            original = getattr(module, name)
+            setattr(module, marker, original)
+            setattr(
+                module,
+                name,
+                _indexed_modulation_wrapper(original, reference, dispatch_arg),
+            )
+            changed = True
+        wrapper = getattr(module, name)
+        for importer in importers:
+            if getattr(importer, "__dict__", {}).get(name) is original:
+                setattr(importer, name, wrapper)
+                changed = True
+    if changed:
+        logger.info(
+            "Applied TPU patch: MiniMax-H3 indexed modulation PyTorch reference "
+            "on devices without Triton."
+        )
+    return changed
+
+
 def apply_minimax_h3_patches() -> bool:
     """Patch the MiniMax-H3 pipeline module if it is already loaded.
 
@@ -536,4 +738,5 @@ def apply_minimax_h3_patches() -> bool:
         )
         return False
     patched = patch_pipeline_tensor_broadcasts(pipeline)
-    return patch_pipeline_object_collectives(pipeline) or patched
+    patched = patch_pipeline_object_collectives(pipeline) or patched
+    return patch_indexed_modulation() or patched
