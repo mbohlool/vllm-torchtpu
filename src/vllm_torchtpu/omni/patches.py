@@ -172,6 +172,10 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fused_qk_norm_rope()
     _patch_worker_proc_async_output_device()
 
+    from vllm_torchtpu.omni.minimax_h3 import apply_minimax_h3_patches
+
+    apply_minimax_h3_patches()
+
 
 def _patch_qwen_image_rope_txt_freqs_clone() -> None:
     # -------------------------------------------------------------------------

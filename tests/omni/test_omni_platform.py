@@ -475,6 +475,7 @@ def test_safe_pack_tensor_if_large():
 def test_safe_pack_tensor_if_large_forwards_new_arguments(monkeypatch):
     from vllm_omni.diffusion import ipc
 
+    from vllm_torchtpu.omni import minimax_h3
     from vllm_torchtpu.omni import patches as omni_patches
 
     orig_mock = MagicMock(return_value="packed")
@@ -501,6 +502,7 @@ def test_safe_pack_tensor_if_large_forwards_new_arguments(monkeypatch):
         "_patch_worker_proc_async_output_device",
     ):
         monkeypatch.setattr(omni_patches, name, lambda: None)
+    monkeypatch.setattr(minimax_h3, "apply_minimax_h3_patches", lambda: False)
     with patch.dict(os.environ):
         apply_omni_model_specific_patches.__wrapped__()
 
