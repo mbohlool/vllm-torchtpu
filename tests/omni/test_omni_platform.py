@@ -472,6 +472,61 @@ def test_safe_pack_tensor_if_large():
     assert res["device"] == "cpu"
 
 
+def test_safe_pack_tensor_if_large_forwards_new_arguments(monkeypatch):
+    from vllm_omni.diffusion import ipc
+
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    orig_mock = MagicMock(return_value="packed")
+    monkeypatch.setattr(ipc, "_pack_tensor_if_large", orig_mock, raising=False)
+
+    # Call the undecorated body so the run-once cache is left alone and restore
+    # the process-global state it edits (F.interpolate, os.environ, the LTX-2
+    # decode output). The other model patches are stubbed out: this test only
+    # covers the IPC wrapper.
+    monkeypatch.setattr(
+        torch.nn.functional, "interpolate", torch.nn.functional.interpolate
+    )
+    monkeypatch.setattr(
+        ltx2_runtime.LTXRuntime,
+        "_decode_output",
+        ltx2_runtime.LTXRuntime._decode_output,
+    )
+    for name in (
+        "_patch_qwen_image_rope_txt_freqs_clone",
+        "_patch_wan_pair_swap_rope",
+        "_patch_wan_ffn_gelu_fence",
+        "_patch_diffusion_startup_warmup_sync",
+        "_patch_wan_fused_qk_norm_rope",
+        "_patch_worker_proc_async_output_device",
+    ):
+        monkeypatch.setattr(omni_patches, name, lambda: None)
+    with patch.dict(os.environ):
+        apply_omni_model_specific_patches.__wrapped__()
+
+    host = torch.ones(2)
+    device_tensor = MagicMock()
+    device_tensor.cpu.return_value = host
+    created = [{"name": "existing"}]
+    d2h_stream = object()
+
+    res = ipc._pack_tensor_if_large(
+        device_tensor,
+        d2h_stream=d2h_stream,
+        created=created,
+        enable_registered_shm=True,
+    )
+
+    assert res == "packed"
+    device_tensor.cpu.assert_called_once_with()
+    orig_mock.assert_called_once()
+    args, kwargs = orig_mock.call_args
+    assert args[0] is host
+    assert args[0].device.type == "cpu"
+    assert args[1] is None
+    assert kwargs == {"created": created, "enable_registered_shm": True}
+
+
 def test_omni_tpu_patches_configuration(monkeypatch):
     # Call the undecorated body so the run-once cache is left alone, and
     # restore the process-global state it edits (env var, F.interpolate).

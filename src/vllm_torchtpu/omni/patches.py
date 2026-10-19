@@ -99,11 +99,26 @@ def apply_omni_model_specific_patches() -> None:
     #    Holding TPU tensors across process boundaries causes the CPU-only
     #    orchestrator process to trigger PJRT backend initialization during
     #    unpickling, colliding with the worker on /tmp/libtpu_lockfile.
+    # 3. Signature drift: ipc._pack_tensor_if_large now takes
+    #    (val, d2h_stream=None, created=None, *, enable_registered_shm=False)
+    #    and its callers pass created= and enable_registered_shm=. A wrapper
+    #    taking only (val, d2h_stream) failed in the worker async output loop
+    #    with "TypeError: ... got an unexpected keyword argument 'created'",
+    #    so all other arguments are forwarded unchanged.
+    # 4. d2h_stream is replaced by None: val.cpu() has already copied the
+    #    tensor to the host, and the original's side-stream path
+    #    (torch.accelerator.set_stream, a pin_memory=True buffer and a
+    #    non_blocking copy) would only add a second host copy and exercise
+    #    pinned memory and stream switching under torch_tpu. The callers
+    #    (pack_diffusion_output_shm and DiffusionWorker._async_output_loop)
+    #    then only call d2h_stream.synchronize(), which is harmless on an
+    #    idle stream.
     #
     # REMOVAL / FIX CONDITION:
     # This patch can be removed once torch_tpu supports safe inter-process tensor
     # serialization / proxy unpickling without triggering PJRT initialization
-    # in host processes that do not own TPU hardware.
+    # in host processes that do not own TPU hardware. Until then the wrapper
+    # must accept the signature of ipc._pack_tensor_if_large.
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion import ipc
 
@@ -112,8 +127,10 @@ def apply_omni_model_specific_patches() -> None:
     def _safe_pack_tensor_if_large(
         val: torch.Tensor,
         d2h_stream: Any = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> Any:
-        return orig_pack_tensor(val.cpu(), d2h_stream=d2h_stream)
+        return orig_pack_tensor(val.cpu(), None, *args, **kwargs)
 
     ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
     logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
