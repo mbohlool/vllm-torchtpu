@@ -2,8 +2,9 @@
 """TPU patches for the vLLM-Omni MiniMax-H3 pipeline.
 
 The patches replace the pipeline's hand-rolled broadcasts and object
-collectives and the Triton-only indexed-modulation kernels, none of which
-run on torch_tpu as written upstream.
+collectives, the video VAE device context and the Triton-only
+indexed-modulation kernels, none of which run on torch_tpu as written
+upstream.
 
 Each patch carries its rationale in a comment block at its entry point.
 Patches only touch modules that are already loaded, do nothing without
@@ -527,6 +528,115 @@ def patch_pipeline_object_collectives(pipeline: Any) -> bool:
 
 
 # -----------------------------------------------------------------------------
+# Video VAE device context.
+# -----------------------------------------------------------------------------
+
+
+def _accelerator_is_tpu() -> bool:
+    accelerator = torch.accelerator.current_accelerator()
+    return accelerator is not None and accelerator.type == "tpu"
+
+
+def _device_index(device: Any) -> int | None:
+    """Index of ``device`` (int, str or torch.device); ``None`` stays ``None``."""
+    if device is None or isinstance(device, int):
+        return device
+    return torch.device(device).index
+
+
+class _TpuDeviceModuleView:
+    """``torch.get_device_module()`` with ``device()`` via ``torch.accelerator``.
+
+    ``device(d)`` returns ``torch.accelerator.device_index(index of d)``;
+    every other attribute (``manual_seed``, ...) is the wrapped module's.
+    """
+
+    __slots__ = ("_target",)
+
+    def __init__(self, target: Any) -> None:
+        self._target = target
+
+    def device(self, device: Any) -> Any:
+        return torch.accelerator.device_index(_device_index(device))
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "_target":
+            raise AttributeError(name)
+        return getattr(self._target, name)
+
+
+class _VideoVAEDeviceModule:
+    """Data descriptor for ``MiniMaxH3VideoVAE.device_module``.
+
+    The module stays in the instance ``__dict__`` (``nn.Module.__setattr__``
+    stores plain values with ``object.__setattr__``, which calls
+    ``__set__``). On TPU, reads wrap it in ``_TpuDeviceModuleView``. Being a
+    class attribute, it also covers VAEs built before the patch.
+    """
+
+    def __get__(self, instance: Any, owner: Any = None) -> Any:
+        if instance is None:
+            return self
+        try:
+            module = instance.__dict__["device_module"]
+        except KeyError:
+            raise AttributeError("device_module") from None
+        if _accelerator_is_tpu():
+            return _TpuDeviceModuleView(module)
+        return module
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        instance.__dict__["device_module"] = value
+
+    def __delete__(self, instance: Any) -> None:
+        try:
+            del instance.__dict__["device_module"]
+        except KeyError:
+            raise AttributeError("device_module") from None
+
+
+def patch_video_vae_device_module(pipeline: Any) -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # Upstream: MiniMaxH3VideoVAE.__init__ sets self.device_module =
+    # torch.get_device_module() (vae.py:377 at vllm-omni e1d77a3), which is
+    # torch_tpu's TpuDeviceModule on TPU. encode_image and encode_video
+    # reseed the keyframe encode with `with self.device_module.device(device):
+    # self.device_module.manual_seed(...)` (vae.py:752, :921).
+    #
+    # Problem on TPU: TpuDeviceModule.device is _DeviceContext (torch_tpu
+    # _internal/device/_device_module.py:222, :389), marked
+    # internal_or_experimental(strict=True) for torch>=2.11, so the call
+    # raised "RuntimeError: _DeviceContext is internal to TorchTPU and can
+    # only be called by the PyTorch framework (torch and torch_tpu). Use
+    # torch.accelerator.device_index instead." on the first-last-frame
+    # (fl2va) task.
+    #
+    # Fix: on TPU, device_module reads as a view whose device() is
+    # torch.accelerator.device_index(index) and whose other attributes are
+    # TpuDeviceModule's (manual_seed is only experimental, not strict).
+    # Other accelerators get the stored module unchanged.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once vLLM-Omni uses torch.accelerator.device_index for the
+    # keyframe-encode reseed, or torch_tpu allows external callers of
+    # TpuDeviceModule.device.
+    # -------------------------------------------------------------------------
+    cls = getattr(pipeline, "MiniMaxH3VideoVAE", None)
+    if cls is None:
+        return False
+    if isinstance(cls.__dict__.get("device_module"), _VideoVAEDeviceModule):
+        return False
+    cls._tpu_orig_device_module = cls.__dict__.get("device_module")
+    cls.device_module = _VideoVAEDeviceModule()
+    logger.info(
+        "Applied TPU patch: MiniMax-H3 video VAE device context via "
+        "torch.accelerator.device_index."
+    )
+    return True
+
+
+# -----------------------------------------------------------------------------
 # Indexed modulation (DiT AdaLN) PyTorch reference.
 # -----------------------------------------------------------------------------
 
@@ -739,4 +849,5 @@ def apply_minimax_h3_patches() -> bool:
         return False
     patched = patch_pipeline_tensor_broadcasts(pipeline)
     patched = patch_pipeline_object_collectives(pipeline) or patched
+    patched = patch_video_vae_device_module(pipeline) or patched
     return patch_indexed_modulation() or patched

@@ -71,7 +71,20 @@ def _fake_pipeline_module(
 
     module._broadcast_tensor = _broadcast_tensor
     module.MiniMaxH3Pipeline = MiniMaxH3Pipeline
+    module.MiniMaxH3VideoVAE = _fake_video_vae_cls()
     return module
+
+
+def _fake_video_vae_cls() -> type:
+    """Fresh stand-in for vae.MiniMaxH3VideoVAE (one class per call)."""
+
+    class MiniMaxH3VideoVAE(torch.nn.Module):
+        def __init__(self, device_module):
+            super().__init__()
+            self.proj = torch.nn.Linear(2, 2)
+            self.device_module = device_module  # vae.py:377
+
+    return MiniMaxH3VideoVAE
 
 
 def _init_gloo(rank: int, world_size: int, init_file: str) -> None:
@@ -618,6 +631,7 @@ def test_minimax_h3_patches_idempotent(monkeypatch):
             pipeline.dist,
             pipeline.MiniMaxH3Pipeline._encoder_group_broadcast_tensor,
             pipeline.MiniMaxH3Pipeline._distribute_encode_inputs,
+            pipeline.MiniMaxH3VideoVAE.__dict__["device_module"],
             *(getattr(modulation, name) for name in _INDEXED_NAMES),
             *(getattr(transformer, name) for name in _INDEXED_NAMES),
         )
@@ -626,6 +640,7 @@ def test_minimax_h3_patches_idempotent(monkeypatch):
     state = patched_state()
     assert isinstance(pipeline.dist, minimax_h3.PipelineDist)
     assert pipeline._tpu_orig_dist is torch.distributed
+    assert isinstance(state[4], minimax_h3._VideoVAEDeviceModule)
     assert not minimax_h3.apply_minimax_h3_patches()
     assert patched_state() == state
 
@@ -873,3 +888,177 @@ def test_indexed_modulation_patch_idempotent(monkeypatch):
 def test_indexed_modulation_noop_without_module(monkeypatch):
     monkeypatch.setitem(sys.modules, minimax_h3.INDEXED_MODULATION_MODULE, None)
     assert minimax_h3.patch_indexed_modulation() is False
+
+
+# -----------------------------------------------------------------------------
+# (g) video VAE device context
+# -----------------------------------------------------------------------------
+
+
+class _FakeTpuDeviceModule:
+    """Stand-in for torch_tpu's TpuDeviceModule (``device`` is internal)."""
+
+    marker = "fake-tpu-device-module"
+
+    def __init__(self, events):
+        self.events = events
+
+    def device(self, device):
+        raise AssertionError("TpuDeviceModule.device is internal to torch_tpu")
+
+    def manual_seed(self, seed):
+        self.events.append(("manual_seed", seed))
+
+
+class _RecordedDeviceIndex:
+    def __init__(self, idx, events):
+        self.idx = idx
+        self.events = events
+
+    def __enter__(self):
+        self.events.append(("enter", self.idx))
+
+    def __exit__(self, *exc_info):
+        self.events.append(("exit", self.idx))
+
+
+@pytest.fixture
+def device_index_recorder(monkeypatch):
+    """Replace torch.accelerator.device_index (restored by monkeypatch)."""
+    recorder = SimpleNamespace(events=[], contexts=[])
+
+    def fake_device_index(idx):
+        recorder.events.append(("device_index", idx))
+        context = _RecordedDeviceIndex(idx, recorder.events)
+        recorder.contexts.append(context)
+        return context
+
+    monkeypatch.setattr(torch.accelerator, "device_index", fake_device_index)
+    return recorder
+
+
+def _set_accelerator(monkeypatch, accelerator_type):
+    accelerator = (
+        None if accelerator_type is None else SimpleNamespace(type=accelerator_type)
+    )
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: accelerator)
+
+
+def _tpu_device_type() -> str:
+    """Return "tpu", or "privateuseone" before torch_tpu renames PrivateUse1.
+
+    torch_tpu's loader calls torch.utils.rename_privateuse1_backend("tpu")
+    only when its runtime loads, which these CPU tests never trigger.
+    """
+    try:
+        torch.device("tpu")
+    except RuntimeError:
+        return "privateuseone"
+    return "tpu"
+
+
+_TPU = _tpu_device_type()
+
+
+def test_tpu_device_module_view_device(device_index_recorder):
+    view = minimax_h3._TpuDeviceModuleView(_FakeTpuDeviceModule([]))
+    devices = (torch.device(_TPU, 0), f"{_TPU}:0", 0, None, torch.device(_TPU, 3))
+    returned = [view.device(device) for device in devices]
+    assert device_index_recorder.events == [
+        ("device_index", 0),
+        ("device_index", 0),
+        ("device_index", 0),
+        ("device_index", None),
+        ("device_index", 3),
+    ]
+    assert returned == device_index_recorder.contexts
+    assert all(isinstance(index, int) for _, index in device_index_recorder.events[:3])
+
+
+def test_tpu_device_module_view_forwards_attributes():
+    events = []
+    module = _FakeTpuDeviceModule(events)
+    view = minimax_h3._TpuDeviceModuleView(module)
+    view.manual_seed(7)
+    assert events == [("manual_seed", 7)]
+    assert view.manual_seed.__self__ is module
+    assert view.marker == "fake-tpu-device-module"
+    assert view._target is module
+    with pytest.raises(AttributeError):
+        _ = view.missing_attribute
+    assert minimax_h3._TpuDeviceModuleView.__slots__ == ("_target",)
+
+
+@pytest.mark.parametrize("accelerator_type", ["tpu", "cuda", None])
+def test_video_vae_device_module_descriptor(monkeypatch, accelerator_type):
+    cls = _fake_video_vae_cls()
+    pipeline = types.ModuleType("fake_pipeline_minimax_h3")
+    pipeline.MiniMaxH3VideoVAE = cls
+    module = _FakeTpuDeviceModule([])
+    # Built before the patch: through nn.Module.__setattr__ and directly.
+    early = cls(module)
+    early_raw = object.__new__(cls)
+    early_raw.__dict__["device_module"] = module
+
+    assert minimax_h3.patch_video_vae_device_module(pipeline)
+    assert cls._tpu_orig_device_module is None
+    assert isinstance(cls.device_module, minimax_h3._VideoVAEDeviceModule)
+    # Built after the patch: nn.Module.__setattr__ reaches the descriptor's
+    # __set__, which stores the raw module in the instance __dict__.
+    late = cls(module)
+    late_raw = object.__new__(cls)
+    late_raw.device_module = module
+    for vae in (late, late_raw):
+        assert vae.__dict__["device_module"] is module
+
+    _set_accelerator(monkeypatch, accelerator_type)
+    for vae in (early, early_raw, late, late_raw):
+        got = vae.device_module
+        if accelerator_type == "tpu":
+            assert isinstance(got, minimax_h3._TpuDeviceModuleView)
+            assert got._target is module
+        else:
+            assert got is module
+
+    del late.device_module
+    assert "device_module" not in late.__dict__
+    with pytest.raises(AttributeError):
+        _ = late.device_module
+
+
+def test_video_vae_keyframe_reseed_loop(monkeypatch, device_index_recorder):
+    events = device_index_recorder.events
+    cls = _fake_video_vae_cls()
+    pipeline = types.ModuleType("fake_pipeline_minimax_h3")
+    pipeline.MiniMaxH3VideoVAE = cls
+    vae = cls(_FakeTpuDeviceModule(events))
+    assert minimax_h3.patch_video_vae_device_module(pipeline)
+    _set_accelerator(monkeypatch, "tpu")
+
+    # vae.py:751-753 (encode_image) / :920-922 (encode_video).
+    with vae.device_module.device(torch.device(_TPU, 0)):
+        vae.device_module.manual_seed(42)
+    assert events == [
+        ("device_index", 0),
+        ("enter", 0),
+        ("manual_seed", 42),
+        ("exit", 0),
+    ]
+
+
+def test_video_vae_device_module_patch_idempotent():
+    cls = _fake_video_vae_cls()
+    original = object()
+    cls.device_module = original  # e.g. a class attribute from a mixin
+    pipeline = types.ModuleType("fake_pipeline_minimax_h3")
+    pipeline.MiniMaxH3VideoVAE = cls
+    assert minimax_h3.patch_video_vae_device_module(pipeline)
+    descriptor = cls.__dict__["device_module"]
+    assert cls._tpu_orig_device_module is original
+    assert not minimax_h3.patch_video_vae_device_module(pipeline)
+    assert cls.__dict__["device_module"] is descriptor
+    assert cls._tpu_orig_device_module is original
+
+    assert not minimax_h3.patch_video_vae_device_module(
+        types.ModuleType("pipeline_without_video_vae")
+    )
