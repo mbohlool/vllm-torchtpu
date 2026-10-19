@@ -153,6 +153,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_ffn_gelu_fence()
     _patch_diffusion_startup_warmup_sync()
     _patch_wan_fused_qk_norm_rope()
+    _patch_worker_proc_async_output_device()
 
 
 def _patch_qwen_image_rope_txt_freqs_clone() -> None:
@@ -322,3 +323,87 @@ def _patch_wan_fused_qk_norm_rope() -> None:
 
     WanSelfAttention.forward = _fused_self_attention_forward
     logger.info("Applied TPU patch: fused q/k RMSNorm + RoPE for Wan attention.")
+
+
+class _LocalDeviceIndexView:
+    """Forwards attribute reads/writes to ``target`` but reports ``gpu_id`` 0."""
+
+    __slots__ = ("_target",)
+
+    def __init__(self, target: Any) -> None:
+        object.__setattr__(self, "_target", target)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "gpu_id":
+            return 0
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_target"), name, value)
+
+
+def _current_accelerator_type() -> str | None:
+    accelerator = torch.accelerator.current_accelerator()
+    return accelerator.type if accelerator is not None else None
+
+
+def _patch_async_output_loop_device(worker_proc_cls: Any) -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # Upstream: WorkerProc._async_output_loop (vllm_omni/diffusion/worker/
+    # diffusion_worker.py:1301 at vllm-omni e1d77a3) creates its D2H side
+    # stream on torch.device(accelerator_type, self.gpu_id).
+    #
+    # Problem on TPU: each diffusion worker process addresses exactly one
+    # chip, always at index 0 (OmniTpuPlatform.set_device calls
+    # torch.accelerator.set_device_index(0)), so ranks with gpu_id > 0 ask
+    # for a device that does not exist.
+    #
+    # Fix: on TPU, run the original loop against a view of the worker whose
+    # gpu_id reads 0; every other attribute read and write goes to the real
+    # worker. Other accelerators get the original loop and the real worker.
+    # Installed only where apply_omni_model_specific_patches runs (see
+    # _patch_worker_proc_async_output_device).
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once vLLM-Omni builds the stream from the platform's local device
+    # (e.g. current_omni_platform.get_torch_device(local_rank) or
+    # torch.accelerator.current_device_index()), or torch_tpu exposes more
+    # than one addressable device per process.
+    # -------------------------------------------------------------------------
+    if "_tpu_orig_async_output_loop" in worker_proc_cls.__dict__:
+        return False
+    orig_loop = worker_proc_cls._async_output_loop
+
+    def _async_output_loop(self: Any) -> None:
+        if _current_accelerator_type() != "tpu":
+            return orig_loop(self)
+        return orig_loop(_LocalDeviceIndexView(self))
+
+    _async_output_loop.__doc__ = orig_loop.__doc__
+    worker_proc_cls._tpu_orig_async_output_loop = orig_loop
+    worker_proc_cls._async_output_loop = _async_output_loop
+    logger.info("Applied TPU patch: diffusion async output stream on local device 0.")
+    return True
+
+
+def _patch_worker_proc_async_output_device() -> None:
+    # apply_omni_model_specific_patches runs only when the loaded pipeline
+    # builds a vLLM-Omni diffusion attention layer (backend selection calls
+    # OmniTpuPlatform.get_diffusion_attn_backend_cls during model load).
+    # That happens inside WorkerProc.__init__ -> _create_worker ->
+    # DiffusionWorker.__init__, before WorkerProc binds
+    # self._async_output_loop as its thread target. Pipelines without such a
+    # layer, e.g. the vae_decode stage of minimax_h3_disaggregated_decode
+    # (MiniMaxH3DecoderPipeline), do not get this patch. Platform init is
+    # too early: it can run while diffusion_worker.py is still importing.
+    import importlib
+
+    try:
+        diffusion_worker = importlib.import_module(
+            "vllm_omni.diffusion.worker.diffusion_worker"
+        )
+    except ImportError as exc:
+        logger.debug("Skipping diffusion async output device patch: %s", exc)
+        return
+    _patch_async_output_loop_device(diffusion_worker.WorkerProc)
