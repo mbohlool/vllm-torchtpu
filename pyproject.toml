@@ -48,7 +48,7 @@ dependencies = [
     #
     # Uncap upper bound in base dependencies so upstream vLLM HEAD canary builds
     # (vllm-torchtpu-integration, requiring transformers>=5.16.1) can resolve.
-    # vllm-omni 0.29.0rc1 specifies its own <5.15 constraint in its package metadata
+    # vllm-omni specifies its own <5.15 constraint in its package metadata
     # for the -omni image. Monitored for potential structured-output spec-decode
     # divergence (#1093) on transformers>=5.17.
     "transformers>=5.10.4",
@@ -94,9 +94,12 @@ benchmarking = [
     "runai-model-streamer[gcs]>=0.17",
 ]
 
-# vLLM-Omni optional dependency
+# vLLM-Omni optional dependency. MiniMax-H3 needs vllm-omni newer than 0.29
+# (minimax_h3 adaln_cache). With uv, [tool.uv.sources] below installs the
+# commit the MiniMax-H3 TPU recipe was validated on; pip resolves the extra
+# from PyPI instead.
 omni = [
-    "vllm-omni==0.29.0rc1",
+    "vllm-omni>=0.30.0",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -284,6 +287,11 @@ include = ["vllm_torchtpu*"]
 
 [tool.uv]
 keyring-provider = "subprocess"
+# vllm-omni pulls opencv-python (via cosmos-guardrail, retinaface-py) while vLLM
+# pulls opencv-python-headless. Both install into cv2/, and if the GUI build
+# wins, importing cv2 needs libGL.so.1, which TPU VM images may lack. Keep only
+# the headless build.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
 
 [[tool.uv.index]]
 name = "torch-tpu-registry"
@@ -294,3 +302,6 @@ explicit = true
 
 [tool.uv.sources]
 torch-tpu = { index = "torch-tpu-registry" }
+# Not on PyPI yet; see the `omni` extra above. uv-only: the built wheel's
+# metadata keeps the plain `vllm-omni>=0.30.0` requirement.
+vllm-omni = { git = "https://github.com/vllm-project/vllm-omni.git", rev = "e1d77a38a7d645283e660b6add4dfb2439732d15" }
