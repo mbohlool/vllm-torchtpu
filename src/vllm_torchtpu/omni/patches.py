@@ -83,6 +83,16 @@ def apply_omni_tpu_patches() -> None:
         "Applied TPU patch: safe torch.nn.functional.interpolate for 1D linear TPU ops."
     )
 
+    from vllm_torchtpu.omni.minimax_h3 import (
+        patch_minimax_h3_checkpoint_modular,
+        patch_video_vae_device_module,
+        patch_video_vae_tile_gather,
+    )
+
+    patch_minimax_h3_checkpoint_modular(import_if_missing=True)
+    if patch_video_vae_tile_gather(import_if_missing=True):
+        patch_video_vae_device_module()
+
 
 @run_once
 def apply_omni_model_specific_patches() -> None:

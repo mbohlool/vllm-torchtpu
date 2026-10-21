@@ -623,6 +623,8 @@ def test_async_output_loop_device(
 def test_minimax_h3_patches_idempotent(monkeypatch):
     pipeline = _fake_pipeline_module(None, None, 0, 1)
     monkeypatch.setitem(sys.modules, minimax_h3.PIPELINE_MODULE, pipeline)
+    monkeypatch.delitem(sys.modules, minimax_h3.CHECKPOINT_MODULE, raising=False)
+    monkeypatch.delitem(sys.modules, minimax_h3.VAE_MODULE, raising=False)
     modulation, transformer, _ = _fake_indexed_modulation(monkeypatch)
 
     def patched_state():
@@ -632,6 +634,7 @@ def test_minimax_h3_patches_idempotent(monkeypatch):
             pipeline.MiniMaxH3Pipeline._encoder_group_broadcast_tensor,
             pipeline.MiniMaxH3Pipeline._distribute_encode_inputs,
             pipeline.MiniMaxH3VideoVAE.__dict__["device_module"],
+            pipeline.MiniMaxH3VideoVAE.__dict__["__init__"],
             *(getattr(modulation, name) for name in _INDEXED_NAMES),
             *(getattr(transformer, name) for name in _INDEXED_NAMES),
         )
@@ -641,6 +644,7 @@ def test_minimax_h3_patches_idempotent(monkeypatch):
     assert isinstance(pipeline.dist, minimax_h3.PipelineDist)
     assert pipeline._tpu_orig_dist is torch.distributed
     assert isinstance(state[4], minimax_h3._VideoVAEDeviceModule)
+    assert "_tpu_orig_init_tile_gather" in pipeline.MiniMaxH3VideoVAE.__dict__
     assert not minimax_h3.apply_minimax_h3_patches()
     assert patched_state() == state
 
@@ -659,6 +663,8 @@ def test_patches_skip_modules_that_are_not_loaded(monkeypatch):
     # modules that are not already loaded must not be imported.
     h3_names = (
         minimax_h3.PIPELINE_MODULE,
+        minimax_h3.CHECKPOINT_MODULE,
+        minimax_h3.VAE_MODULE,
         minimax_h3.INDEXED_MODULATION_MODULE,
         *minimax_h3.INDEXED_MODULATION_IMPORTERS,
     )
@@ -672,6 +678,8 @@ def test_patches_skip_modules_that_are_not_loaded(monkeypatch):
 
     monkeypatch.setattr(importlib, "import_module", guarded_import)
     assert minimax_h3.apply_minimax_h3_patches() is False
+    assert minimax_h3.patch_minimax_h3_checkpoint_modular() is False
+    assert minimax_h3.patch_video_vae_tile_gather() is False
     assert minimax_h3.patch_indexed_modulation() is False
     assert all(name not in sys.modules for name in h3_names)
 
@@ -1062,3 +1070,377 @@ def test_video_vae_device_module_patch_idempotent():
     assert not minimax_h3.patch_video_vae_device_module(
         types.ModuleType("pipeline_without_video_vae")
     )
+
+
+# -----------------------------------------------------------------------------
+# (h) released MiniMax-H3 checkpoint layout detection
+# -----------------------------------------------------------------------------
+
+
+def _fake_checkpoint_module():
+    """Stand-in for vllm_omni.model_executor.models.minimax_h3.checkpoint."""
+    module = types.ModuleType(minimax_h3.CHECKPOINT_MODULE)
+    calls = []
+
+    def is_minimax_h3_modular(model: str, revision: str | None = None) -> bool:
+        calls.append((model, revision))
+        path = os.fspath(model) if isinstance(model, os.PathLike) else str(model)
+        if os.path.isdir(path):
+            return os.path.isfile(
+                os.path.join(path, "modular_model_index.json")
+            ) or os.path.isfile(os.path.join(path, "fastvideo_inference.json"))
+        return path.startswith("FastVideo/")
+
+    module.is_minimax_h3_modular = is_minimax_h3_modular
+    module.calls = calls
+    return module
+
+
+def test_checkpoint_modular_local_layouts(monkeypatch, tmp_path):
+    checkpoint = _fake_checkpoint_module()
+    monkeypatch.setitem(sys.modules, minimax_h3.CHECKPOINT_MODULE, checkpoint)
+    assert minimax_h3.patch_minimax_h3_checkpoint_modular()
+
+    # 1. Released MiniMaxAI/MiniMax-H3 root: modular_model_index.json + FL2VA
+    #    (no fastvideo_inference.json) -> False.
+    fl2va_root = tmp_path / "minimax_h3_fl2va"
+    (fl2va_root / "FL2VA").mkdir(parents=True)
+    (fl2va_root / "modular_model_index.json").write_text(
+        '{"_class_name": "MiniMaxH3ModularPipeline"}'
+    )
+    (fl2va_root / "FL2VA" / "model_index.json").write_text(
+        '{"_class_name": "MiniMaxH3Pipeline"}'
+    )
+    assert checkpoint._tpu_orig_is_minimax_h3_modular(str(fl2va_root)) is True
+    assert checkpoint.is_minimax_h3_modular(str(fl2va_root)) is False
+
+    # 2. Released root with Ref2VA/model_index.json only -> False.
+    ref2va_root = tmp_path / "minimax_h3_ref2va"
+    (ref2va_root / "Ref2VA").mkdir(parents=True)
+    (ref2va_root / "modular_model_index.json").write_text(
+        '{"_class_name": "MiniMaxH3ModularPipeline"}'
+    )
+    (ref2va_root / "Ref2VA" / "model_index.json").write_text(
+        '{"_class_name": "MiniMaxH3Pipeline"}'
+    )
+    assert checkpoint.is_minimax_h3_modular(str(ref2va_root)) is False
+
+    # 3. True modular FastH3 root with fastvideo_inference.json -> True
+    #    (even if FL2VA/model_index.json is also present).
+    fasth3_root = tmp_path / "fasth3"
+    (fasth3_root / "FL2VA").mkdir(parents=True)
+    (fasth3_root / "modular_model_index.json").write_text(
+        '{"_class_name": "MiniMaxH3ModularPipeline"}'
+    )
+    (fasth3_root / "fastvideo_inference.json").write_text("{}")
+    (fasth3_root / "FL2VA" / "model_index.json").write_text(
+        '{"_class_name": "MiniMaxH3Pipeline"}'
+    )
+    assert checkpoint.is_minimax_h3_modular(str(fasth3_root)) is True
+
+    # 4. Pointing directly to the FL2VA partition subdirectory -> False.
+    assert checkpoint.is_minimax_h3_modular(str(fl2va_root / "FL2VA")) is False
+
+    # 5. Non-existent path / Hub repo IDs delegate to original unchanged.
+    checkpoint.calls.clear()
+    assert checkpoint.is_minimax_h3_modular("MiniMaxAI/MiniMax-H3", "main") is False
+    assert (
+        checkpoint.is_minimax_h3_modular(
+            "FastVideo/FastVideo-FastH3-8-Step-V2", revision="v2"
+        )
+        is True
+    )
+    assert checkpoint.calls == [
+        ("MiniMaxAI/MiniMax-H3", "main"),
+        ("FastVideo/FastVideo-FastH3-8-Step-V2", "v2"),
+    ]
+
+
+def test_checkpoint_modular_rebinds_importers_and_idempotent(monkeypatch, tmp_path):
+    checkpoint = _fake_checkpoint_module()
+    orig = checkpoint.is_minimax_h3_modular
+    pipeline = types.ModuleType(minimax_h3.PIPELINE_MODULE)
+    pipeline.is_minimax_h3_modular = orig
+    other_omni = types.ModuleType("vllm_omni.diffusion.models.minimax_h3.other")
+    other_omni.is_minimax_h3_modular = orig
+
+    monkeypatch.setitem(sys.modules, minimax_h3.CHECKPOINT_MODULE, checkpoint)
+    monkeypatch.setitem(sys.modules, minimax_h3.PIPELINE_MODULE, pipeline)
+    monkeypatch.setitem(sys.modules, other_omni.__name__, other_omni)
+
+    assert minimax_h3.patch_minimax_h3_checkpoint_modular() is True
+    wrapper = checkpoint.is_minimax_h3_modular
+    assert wrapper is not orig
+    assert checkpoint._tpu_orig_is_minimax_h3_modular is orig
+    assert pipeline.is_minimax_h3_modular is wrapper
+    assert other_omni.is_minimax_h3_modular is wrapper
+
+    # Second call is a no-op.
+    assert minimax_h3.patch_minimax_h3_checkpoint_modular() is False
+
+    # If a late importer bound the original before the patch ran again, re-running
+    # rebinds that importer and is then idempotent again.
+    late = types.ModuleType("vllm_omni.diffusion.models.minimax_h3.late")
+    late.is_minimax_h3_modular = orig
+    monkeypatch.setitem(sys.modules, late.__name__, late)
+    assert minimax_h3.patch_minimax_h3_checkpoint_modular() is True
+    assert late.is_minimax_h3_modular is wrapper
+    assert minimax_h3.patch_minimax_h3_checkpoint_modular() is False
+
+    # import_if_missing=True imports when absent and handles ImportError cleanly.
+    monkeypatch.delitem(sys.modules, minimax_h3.CHECKPOINT_MODULE)
+    fresh = _fake_checkpoint_module()
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name, package=None: (
+            fresh
+            if name == minimax_h3.CHECKPOINT_MODULE
+            else (_ for _ in ()).throw(ImportError(name))
+        ),
+    )
+    assert minimax_h3.patch_minimax_h3_checkpoint_modular(import_if_missing=True)
+    assert fresh.is_minimax_h3_modular is not fresh._tpu_orig_is_minimax_h3_modular
+
+    monkeypatch.delitem(sys.modules, minimax_h3.CHECKPOINT_MODULE, raising=False)
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name, package=None: (_ for _ in ()).throw(ImportError(name)),
+    )
+    assert (
+        minimax_h3.patch_minimax_h3_checkpoint_modular(import_if_missing=True) is False
+    )
+
+
+# -----------------------------------------------------------------------------
+# (i) video VAE equal-shape tile gather
+# -----------------------------------------------------------------------------
+
+
+def _fake_tile_gather_vae_cls():
+    """Stand-in for MiniMaxH3VideoVAE with model._all_gather_tiled_results."""
+
+    class MiniMaxH3VideoVAE(torch.nn.Module):
+        def __init__(self, device, *, sp_group=None, sp_size=1, sp_rank=0):
+            super().__init__()
+            self._device_target = device
+            self._checkpoint_tile_gather = None
+            self.parallel_size = sp_size
+            self._state = {
+                "sp_process_group": sp_group,
+                "sp_size": sp_size,
+                "sp_rank": sp_rank,
+            }
+
+            def upstream_gather(tasks, num_tiles):
+                raise AssertionError("unpatched _all_gather_tiled_results called")
+
+            self.upstream_gather = upstream_gather
+            self.model = SimpleNamespace(_all_gather_tiled_results=upstream_gather)
+
+        def _native_parallel_state(self):
+            return self._state
+
+        def set_parallel_size(self, parallel_size, mode="tile", process_group=None):
+            self.parallel_size = int(parallel_size)
+            self._state["sp_size"] = int(parallel_size)
+            if process_group is not None:
+                self._state["sp_process_group"] = process_group
+            return "set_parallel_size_done"
+
+    return MiniMaxH3VideoVAE
+
+
+def _vae_tile_gather_worker(rank: int, world_size: int, init_file: str) -> None:
+    _init_gloo(rank, world_size, init_file)
+    try:
+        group = dist.group.WORLD
+        cls = _fake_tile_gather_vae_cls()
+        assert minimax_h3.patch_video_vae_tile_gather(cls)
+        vae = cls(
+            SimpleNamespace(type="tpu"),
+            sp_group=group,
+            sp_size=world_size,
+            sp_rank=rank,
+        )
+        # Uneven tiles (num_tiles=3 across 2 ranks: rank 0 owns [0, 2], rank 1 owns [1])
+        # and even tiles (num_tiles=4: rank 0 owns [0, 2], rank 1 owns [1, 3]).
+        for num_tiles in (3, 4):
+            all_tiles = [
+                torch.full((2, 3, 4), float(t + 1), dtype=torch.float32)
+                for t in range(num_tiles)
+            ]
+            local_tasks = [all_tiles[t] for t in range(rank, num_tiles, world_size)]
+            gathered = vae.model._all_gather_tiled_results(local_tasks, num_tiles)
+            assert len(gathered) == num_tiles
+            for idx, expected in enumerate(all_tiles):
+                _assert_same(gathered[idx], expected)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_video_vae_tile_gather_over_gloo(tmp_path):
+    _spawn(_vae_tile_gather_worker, tmp_path)
+
+
+@pytest.mark.parametrize(("sp_size", "num_tiles"), [(8, 9), (4, 5), (4, 4)])
+def test_video_vae_tile_gather_uneven_ranks(monkeypatch, sp_size, num_tiles):
+    cls = _fake_tile_gather_vae_cls()
+    assert minimax_h3.patch_video_vae_tile_gather(cls)
+
+    max_tasks = -(-num_tiles // sp_size)
+    tile_shape = (2, 3, 4, 4)
+    all_tiles = [
+        (
+            torch.arange(2 * 3 * 4 * 4, dtype=torch.float32).reshape(tile_shape)
+            + t * 100
+        ).to(torch.bfloat16)
+        for t in range(num_tiles)
+    ]
+
+    # Build the padded tensor each rank would send into dist.all_gather.
+    expected_rank_inputs = []
+    for r in range(sp_size):
+        r_tasks = [all_tiles[t] for t in range(r, num_tiles, sp_size)]
+        pad = [torch.zeros_like(r_tasks[0]) for _ in range(max_tasks - len(r_tasks))]
+        expected_rank_inputs.append(torch.stack(r_tasks + pad, dim=0))
+
+    for sp_rank in range(sp_size):
+        events = []
+
+        def fake_all_gather(
+            tensor_list,
+            tensor,
+            group=None,
+            _events=events,
+            _rank=sp_rank,
+        ):
+            _events.append(("all_gather", group, tensor.dtype, tuple(tensor.shape)))
+            _assert_same(tensor, expected_rank_inputs[_rank])
+            assert len(tensor_list) == sp_size
+            for r, out_slot in enumerate(tensor_list):
+                assert out_slot.dtype == tensor.dtype
+                assert out_slot.shape == tensor.shape
+                out_slot.copy_(expected_rank_inputs[r])
+
+        monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+        vae = cls(
+            SimpleNamespace(type="tpu"),
+            sp_group=_DEVICE_GROUP,
+            sp_size=sp_size,
+            sp_rank=sp_rank,
+        )
+        local_tasks = [all_tiles[t] for t in range(sp_rank, num_tiles, sp_size)]
+        results = vae.model._all_gather_tiled_results(local_tasks, num_tiles)
+
+        assert events == [
+            ("all_gather", _DEVICE_GROUP, torch.bfloat16, (max_tasks, *tile_shape))
+        ]
+        assert len(results) == num_tiles
+        for idx, want in enumerate(all_tiles):
+            _assert_same(results[idx], want)
+
+
+def test_video_vae_tile_gather_validation_errors():
+    cls = _fake_tile_gather_vae_cls()
+    assert minimax_h3.patch_video_vae_tile_gather(cls)
+    vae = cls(
+        SimpleNamespace(type="tpu"),
+        sp_group=_DEVICE_GROUP,
+        sp_size=4,
+        sp_rank=2,
+    )
+    with pytest.raises(ValueError, match="Found empty tasks on sp rank 2"):
+        vae.model._all_gather_tiled_results([], 5)
+
+    tile = torch.ones(2, 2)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "sp rank 2 holds 3 tiles but round-robin ownership of 5 tiles "
+            "across 4 ranks gives it 1"
+        ),
+    ):
+        vae.model._all_gather_tiled_results([tile, tile, tile], 5)
+
+    # A rank holding fewer tiles than it owns must fail instead of
+    # decoding zero padding as image tiles.
+    vae0 = cls(
+        SimpleNamespace(type="tpu"),
+        sp_group=_DEVICE_GROUP,
+        sp_size=4,
+        sp_rank=0,
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            "sp rank 0 holds 1 tiles but round-robin ownership of 5 tiles "
+            "across 4 ranks gives it 2"
+        ),
+    ):
+        vae0.model._all_gather_tiled_results([tile], 5)
+
+
+def test_video_vae_tile_gather_device_gating_and_lifecycle(monkeypatch):
+    cls = _fake_tile_gather_vae_cls()
+    vae_mod = types.ModuleType(minimax_h3.VAE_MODULE)
+    vae_mod.MiniMaxH3VideoVAE = cls
+    monkeypatch.setitem(sys.modules, minimax_h3.VAE_MODULE, vae_mod)
+
+    # Built before patch on TPU: set_parallel_size after patch installs the gather.
+    early_tpu = cls(SimpleNamespace(type="tpu"))
+    assert early_tpu.model._all_gather_tiled_results is early_tpu.upstream_gather
+
+    assert minimax_h3.patch_video_vae_tile_gather() is True
+    assert minimax_h3.patch_video_vae_tile_gather() is False
+
+    assert early_tpu.set_parallel_size(4, process_group=_DEVICE_GROUP) == (
+        "set_parallel_size_done"
+    )
+    assert (
+        getattr(early_tpu.model._all_gather_tiled_results, "__func__", None)
+        is minimax_h3.tpu_vae_tile_gather
+    )
+    assert early_tpu._checkpoint_tile_gather is early_tpu.upstream_gather
+
+    # Built after patch on TPU: __init__ installs immediately, and
+    # set_parallel_size re-installs if model._all_gather_tiled_results was reset.
+    late_tpu = cls("tpu:0")
+    assert (
+        getattr(late_tpu.model._all_gather_tiled_results, "__func__", None)
+        is minimax_h3.tpu_vae_tile_gather
+    )
+    assert late_tpu._checkpoint_tile_gather is late_tpu.upstream_gather
+    late_tpu.model._all_gather_tiled_results = late_tpu.upstream_gather
+    late_tpu.set_parallel_size(8, process_group=_DEVICE_GROUP)
+    assert (
+        getattr(late_tpu.model._all_gather_tiled_results, "__func__", None)
+        is minimax_h3.tpu_vae_tile_gather
+    )
+
+    # Non-TPU devices (cpu, cuda, xpu) stay untouched.
+    _set_accelerator(monkeypatch, "tpu")
+    for dev in (torch.device("cpu"), SimpleNamespace(type="cuda"), "xpu:0"):
+        non_tpu = cls(dev)
+        assert non_tpu.model._all_gather_tiled_results is non_tpu.upstream_gather
+        non_tpu.set_parallel_size(2)
+        assert non_tpu.model._all_gather_tiled_results is non_tpu.upstream_gather
+
+    # import_if_missing=True imports VAE_MODULE when not yet in sys.modules.
+    monkeypatch.delitem(sys.modules, minimax_h3.VAE_MODULE)
+    fresh_cls = _fake_tile_gather_vae_cls()
+    fresh_mod = types.ModuleType(minimax_h3.VAE_MODULE)
+    fresh_mod.MiniMaxH3VideoVAE = fresh_cls
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name, package=None: (
+            fresh_mod
+            if name == minimax_h3.VAE_MODULE
+            else (_ for _ in ()).throw(ImportError(name))
+        ),
+    )
+    assert minimax_h3.patch_video_vae_tile_gather(import_if_missing=True) is True
+    assert "_tpu_orig_init_tile_gather" in fresh_cls.__dict__

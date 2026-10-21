@@ -3,9 +3,10 @@
 
 The patches fall into three groups, in file order:
 
-- Correctness: the pipeline's hand-rolled broadcasts and object collectives,
-  the video VAE device context and the Triton-only indexed-modulation
-  kernels, none of which run on torch_tpu as written upstream.
+- Correctness: the released checkpoint layout check, the pipeline's
+  hand-rolled broadcasts and object collectives, the video VAE device context
+  and tile gather, and the Triton-only indexed-modulation kernels, none of
+  which run on torch_tpu as written upstream.
 - Denoise performance: keep every DiT step on one set of shapes and keep
   host syncs out of the denoise loop (AdaLN cache, timestep table, RoPE
   table, finite checks, row gathers and scatters).
@@ -21,12 +22,14 @@ nothing.
 import contextlib
 import functools
 import hashlib
+import importlib
 import inspect
 import pickle
 import sys
 import types
 import weakref
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -37,6 +40,11 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 PIPELINE_MODULE = "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3"
+CHECKPOINT_MODULE = "vllm_omni.model_executor.models.minimax_h3.checkpoint"
+# Modules that bind is_minimax_h3_modular by name at import time.
+CHECKPOINT_IMPORTERS = (PIPELINE_MODULE,)
+DIFFUSERS_TASK_SUBDIRS = ("FL2VA", "Ref2VA")
+VAE_MODULE = "vllm_omni.diffusion.models.minimax_h3.vae"
 INDEXED_MODULATION_MODULE = "vllm_omni.diffusion.layers.indexed_modulation"
 # Modules that bind the indexed-modulation functions by name at import time.
 INDEXED_MODULATION_IMPORTERS = (
@@ -366,6 +374,132 @@ def world_cpu_group(pipeline: Any, group: Any) -> Any:
 # -----------------------------------------------------------------------------
 
 
+def _is_tpu(value: Any) -> bool:
+    """Whether a tensor, device or device string is on torch_tpu.
+
+    Values with no device (e.g. ``None``) count as not TPU.
+    """
+    device = getattr(value, "device", value)
+    if isinstance(device, str):
+        return device.split(":", 1)[0] == "tpu"
+    return getattr(device, "type", None) == "tpu"
+
+
+def _loaded_module(name: str) -> types.ModuleType | None:
+    """``sys.modules[name]`` if it is a loaded module (never imports it)."""
+    module = sys.modules.get(name)
+    return module if isinstance(module, types.ModuleType) else None
+
+
+def _is_released_diffusers_root(model: Any) -> bool:
+    """Whether ``model`` is a local MiniMax-H3 root with FL2VA/Ref2VA subdirs
+    and no ``fastvideo_inference.json``.
+    """
+    try:
+        path = Path(model)
+        if not path.is_dir():
+            return False
+    except (TypeError, ValueError, OSError):
+        return False
+    if (path / "fastvideo_inference.json").is_file():
+        return False
+    return any(
+        (path / subdir / "model_index.json").is_file()
+        for subdir in DIFFUSERS_TASK_SUBDIRS
+    )
+
+
+def patch_minimax_h3_checkpoint_modular(*, import_if_missing: bool = False) -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: is_minimax_h3_modular (vllm_omni/model_executor/models/
+    # minimax_h3/checkpoint.py:25-39 at vllm-omni e1d77a3) returns True for any
+    # local directory containing modular_model_index.json or
+    # fastvideo_inference.json.
+    #
+    # Problem on TPU (and any local snapshot of MiniMaxAI/MiniMax-H3): the
+    # released MiniMaxAI/MiniMax-H3 repository on Hugging Face ships both
+    # modular_model_index.json (_class_name: MiniMaxH3ModularPipeline) at the
+    # root and the partitioned Diffusers layout (FL2VA/model_index.json and
+    # Ref2VA/model_index.json), without fastvideo_inference.json. Once
+    # _resolve_minimax_h3_model_root downloads the snapshot (or when a local
+    # snapshot path is passed), is_minimax_h3_modular returns True, so
+    # resolve_minimax_h3_diffusion_model_path returns the root instead of
+    # FL2VA/ and MiniMaxH3Pipeline.__init__ tries to read
+    # fastvideo_inference.json, raising FileNotFoundError.
+    #
+    # Fix: wrap is_minimax_h3_modular so that when the original returns True
+    # for a local directory without fastvideo_inference.json that contains
+    # FL2VA/model_index.json or Ref2VA/model_index.json, it returns False and
+    # the pipeline loads the FL2VA / Ref2VA partition. Rebind any loaded
+    # module that imported is_minimax_h3_modular by name (pipeline_minimax_h3).
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once upstream is_minimax_h3_modular checks for
+    # fastvideo_inference.json (or the absence of FL2VA / Ref2VA partitions)
+    # on local directories.
+    # -------------------------------------------------------------------------
+    module = _loaded_module(CHECKPOINT_MODULE)
+    if module is None and import_if_missing:
+        try:
+            module = importlib.import_module(CHECKPOINT_MODULE)
+        except ImportError as exc:
+            logger.debug("Skipping MiniMax-H3 checkpoint modular patch: %s", exc)
+            return False
+        except Exception as exc:  # A broken optional import must not stop startup.
+            logger.warning("Skipping MiniMax-H3 checkpoint modular patch: %r", exc)
+            return False
+    if module is None:
+        logger.debug(
+            "Skipping MiniMax-H3 checkpoint modular patch: %s is not loaded.",
+            CHECKPOINT_MODULE,
+        )
+        return False
+
+    marker = "_tpu_orig_is_minimax_h3_modular"
+    original = getattr(module, marker, None)
+    changed = False
+    if original is None:
+        original = getattr(module, "is_minimax_h3_modular", None)
+        if not callable(original):
+            return False
+
+        @functools.wraps(original)
+        def is_minimax_h3_modular(model: str, revision: str | None = None) -> bool:
+            is_modular = original(model, revision=revision)
+            if not is_modular:
+                return False
+            return not _is_released_diffusers_root(model)
+
+        setattr(module, marker, original)
+        module.is_minimax_h3_modular = is_minimax_h3_modular
+        changed = True
+
+    wrapper = module.is_minimax_h3_modular
+    importers = [
+        loaded
+        for loaded in (_loaded_module(name) for name in CHECKPOINT_IMPORTERS)
+        if loaded is not None
+    ]
+    importers.extend(
+        loaded
+        for loaded_name, loaded in list(sys.modules.items())
+        if loaded_name.startswith("vllm_omni.")
+        and isinstance(loaded, types.ModuleType)
+        and loaded is not module
+        and all(loaded is not importer for importer in importers)
+    )
+    for importer in importers:
+        if getattr(importer, "__dict__", {}).get("is_minimax_h3_modular") is original:
+            importer.is_minimax_h3_modular = wrapper
+            changed = True
+    if changed:
+        logger.info(
+            "Applied TPU patch: MiniMax-H3 released Diffusers checkpoint detection."
+        )
+    return changed
+
+
 def patch_pipeline_tensor_broadcasts(pipeline: Any) -> bool:
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
@@ -606,7 +740,7 @@ class _VideoVAEDeviceModule:
             raise AttributeError("device_module") from None
 
 
-def patch_video_vae_device_module(pipeline: Any) -> bool:
+def patch_video_vae_device_module(pipeline: Any = None) -> bool:
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
     # Upstream: MiniMaxH3VideoVAE.__init__ sets self.device_module =
@@ -633,7 +767,8 @@ def patch_video_vae_device_module(pipeline: Any) -> bool:
     # keyframe-encode reseed, or torch_tpu allows external callers of
     # TpuDeviceModule.device.
     # -------------------------------------------------------------------------
-    cls = getattr(pipeline, "MiniMaxH3VideoVAE", None)
+    target = pipeline if pipeline is not None else _loaded_module(VAE_MODULE)
+    cls = getattr(target, "MiniMaxH3VideoVAE", None)
     if cls is None:
         return False
     if isinstance(cls.__dict__.get("device_module"), _VideoVAEDeviceModule):
@@ -645,6 +780,191 @@ def patch_video_vae_device_module(pipeline: Any) -> bool:
         "torch.accelerator.device_index."
     )
     return True
+
+
+def _vae_is_on_tpu(vae: Any) -> bool:
+    device_target = getattr(vae, "_device_target", None)
+    if _is_tpu(device_target):
+        return True
+    if device_target is not None:
+        dtype = (
+            device_target.split(":", 1)[0]
+            if isinstance(device_target, str)
+            else getattr(device_target, "type", None)
+        )
+        if dtype is not None and dtype != "privateuseone":
+            return False
+    return _accelerator_is_tpu()
+
+
+def tpu_vae_tile_gather(
+    self: Any,
+    tasks: list[torch.Tensor],
+    num_tiles: int,
+) -> list[torch.Tensor]:
+    """Equal-shape ``all_gather`` for ``MiniMaxH3VideoVAE`` tiled encode/decode.
+
+    Pads short ranks with zeros to ``ceil(num_tiles / sp_size)``, gathers
+    equal-shape tensors in ``tasks[0].dtype`` with device sync fences, and
+    reassembles the ``num_tiles`` tiles in round-robin order.
+    """
+    state = self._native_parallel_state()
+    group = state["sp_process_group"]
+    sp_size = int(state["sp_size"])
+    sp_rank = int(state["sp_rank"])
+
+    if not tasks:
+        raise ValueError(f"Found empty tasks on sp rank {sp_rank}")
+
+    max_tasks = -(-num_tiles // sp_size)
+    expected = -(-(num_tiles - sp_rank) // sp_size)
+    if len(tasks) != expected:
+        raise ValueError(
+            f"sp rank {sp_rank} holds {len(tasks)} tiles but round-robin "
+            f"ownership of {num_tiles} tiles across {sp_size} ranks gives it "
+            f"{expected}"
+        )
+    if len(tasks) < max_tasks:
+        pad = [torch.zeros_like(tasks[0]) for _ in range(max_tasks - len(tasks))]
+        stacked = torch.stack(tasks + pad, dim=0).contiguous()
+    else:
+        stacked = torch.stack(tasks, dim=0).contiguous()
+
+    gathered = [torch.empty_like(stacked) for _ in range(sp_size)]
+    _synchronize(stacked.device)
+    torch.distributed.all_gather(gathered, stacked, group=group)
+    _synchronize(stacked.device)
+
+    results: list[torch.Tensor] = [None] * num_tiles  # type: ignore[list-item]
+    for rank in range(sp_size):
+        num_rank_tasks = -(-(num_tiles - rank) // sp_size)
+        for k in range(num_rank_tasks):
+            results[k * sp_size + rank] = gathered[rank][k].clone()
+    return results
+
+
+def _install_tpu_tile_gather(vae: Any) -> None:
+    if not _vae_is_on_tpu(vae):
+        return
+    model = getattr(vae, "model", None)
+    if model is None:
+        return
+    current = getattr(model, "_all_gather_tiled_results", None)
+    if (
+        getattr(current, "__func__", None) is tpu_vae_tile_gather
+        and getattr(current, "__self__", None) is vae
+    ):
+        return
+    if getattr(vae, "_checkpoint_tile_gather", None) is None:
+        vae._checkpoint_tile_gather = current
+    model._all_gather_tiled_results = types.MethodType(tpu_vae_tile_gather, vae)
+    logger.info("[H3_VAE_GATHER] TPU tile gather installed device=tpu")
+
+
+def _patch_video_vae_cls_tile_gather(cls: type) -> bool:
+    if "_tpu_orig_init_tile_gather" in cls.__dict__:
+        return False
+    orig_init = getattr(cls, "__init__", None)
+    if not callable(orig_init):
+        return False
+
+    @functools.wraps(orig_init)
+    def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
+        orig_init(self, *args, **kwargs)
+        _install_tpu_tile_gather(self)
+
+    cls._tpu_orig_init_tile_gather = orig_init
+    cls.__init__ = __init__
+
+    orig_set_parallel_size = getattr(cls, "set_parallel_size", None)
+    if callable(orig_set_parallel_size):
+
+        @functools.wraps(orig_set_parallel_size)
+        def set_parallel_size(self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = orig_set_parallel_size(self, *args, **kwargs)
+            _install_tpu_tile_gather(self)
+            return result
+
+        cls._tpu_orig_set_parallel_size = orig_set_parallel_size
+        cls.set_parallel_size = set_parallel_size
+
+    return True
+
+
+def patch_video_vae_tile_gather(
+    target: Any = None,
+    *,
+    import_if_missing: bool = False,
+) -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni & torch_tpu Root Cause Tracking:
+    # Upstream:
+    # 1. The released MiniMax-H3 remote-code video VAE
+    #    (AutoencoderKLLegacy._all_gather_tiled_results, FL2VA/video_vae/
+    #    klvae.py) gathers per-rank tile stacks of unequal length (e.g. 9
+    #    tiles across 8 ranks at 768x768) with all_gather_var_shape, which
+    #    first writes each rank's shape into an int64 device tensor with a
+    #    slice write and all_gathers it. On torch_tpu (tpu_dist) the gathered
+    #    shapes read back as zeros, the same int64 slice-write + collective
+    #    defect as the pipeline broadcasts above, so every gathered stack is
+    #    empty, results stay None and tiled_decode fails with
+    #    "AttributeError: 'NoneType' object has no attribute 'to'".
+    # 2. MiniMaxH3VideoVAE._tile_gather_reuse_enabled (vllm_omni/diffusion/
+    #    models/minimax_h3/vae.py:519-531 at vllm-omni e1d77a3) only enables
+    #    its equal-shape replacement on XPU, and _persistent_tile_gather
+    #    (:616-649) carves a torch.uint8 byte workspace with view(stacked.dtype)
+    #    + dist.all_gather_into_tensor, which triggers dynamic bitcast /
+    #    byte-workspace issues on XLA/TPU.
+    #
+    # Fix: on TPU, bind self.model._all_gather_tiled_results to
+    # tpu_vae_tile_gather across MiniMaxH3VideoVAE.__init__ and
+    # set_parallel_size. Short ranks pad to ceil(num_tiles / sp_size) with
+    # zeros in the tile's float dtype, all ranks run one equal-shape
+    # dist.all_gather between device sync fences, and tiles are reassembled
+    # in round-robin order (results[k * sp_size + rank]).
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once MiniMaxH3VideoVAE uses an equal-shape float tensor
+    # all_gather on TPU (or torch_tpu supports unequal-shape all_gather and
+    # uint8 byte-workspace bitcasts).
+    # -------------------------------------------------------------------------
+    classes: list[type] = []
+    if isinstance(target, type):
+        classes.append(target)
+    elif target is not None:
+        cls = getattr(target, "MiniMaxH3VideoVAE", None)
+        if isinstance(cls, type):
+            classes.append(cls)
+    vae_module = _loaded_module(VAE_MODULE)
+    if vae_module is None and target is None and import_if_missing:
+        try:
+            vae_module = importlib.import_module(VAE_MODULE)
+        except ImportError as exc:
+            logger.debug("Skipping MiniMax-H3 video VAE tile gather TPU patch: %s", exc)
+            return False
+        except Exception as exc:  # A broken optional import must not stop startup.
+            logger.warning(
+                "Skipping MiniMax-H3 video VAE tile gather TPU patch: %r", exc
+            )
+            return False
+    if vae_module is not None:
+        vae_cls = getattr(vae_module, "MiniMaxH3VideoVAE", None)
+        if isinstance(vae_cls, type) and all(vae_cls is not c for c in classes):
+            classes.append(vae_cls)
+    if not classes and target is None:
+        pipeline = _loaded_module(PIPELINE_MODULE)
+        pipe_cls = getattr(pipeline, "MiniMaxH3VideoVAE", None)
+        if isinstance(pipe_cls, type):
+            classes.append(pipe_cls)
+    if not classes:
+        return False
+
+    patched = False
+    for cls in classes:
+        patched = _patch_video_vae_cls_tile_gather(cls) or patched
+    if patched:
+        logger.info("Applied TPU patch: MiniMax-H3 video VAE equal-shape tile gather.")
+    return patched
 
 
 # -----------------------------------------------------------------------------
@@ -847,23 +1167,6 @@ def patch_indexed_modulation() -> bool:
 # -----------------------------------------------------------------------------
 
 ADALN_CACHE_MODULE = "vllm_omni.diffusion.models.minimax_h3.adaln_cache"
-
-
-def _is_tpu(value: Any) -> bool:
-    """Whether a tensor, device or device string is on torch_tpu.
-
-    Values with no device (e.g. ``None``) count as not TPU.
-    """
-    device = getattr(value, "device", value)
-    if isinstance(device, str):
-        return device.split(":", 1)[0] == "tpu"
-    return getattr(device, "type", None) == "tpu"
-
-
-def _loaded_module(name: str) -> types.ModuleType | None:
-    """``sys.modules[name]`` if it is a loaded module (never imports it)."""
-    module = sys.modules.get(name)
-    return module if isinstance(module, types.ModuleType) else None
 
 
 def patch_adaln_projection_cache() -> bool:
@@ -2109,9 +2412,11 @@ def apply_minimax_h3_patches() -> bool:
             "Skipping MiniMax-H3 TPU patches: %s is not loaded.", PIPELINE_MODULE
         )
         return False
-    patched = patch_pipeline_tensor_broadcasts(pipeline)
+    patched = patch_minimax_h3_checkpoint_modular()
+    patched = patch_pipeline_tensor_broadcasts(pipeline) or patched
     patched = patch_pipeline_object_collectives(pipeline) or patched
     patched = patch_video_vae_device_module(pipeline) or patched
+    patched = patch_video_vae_tile_gather(pipeline) or patched
     patched = patch_indexed_modulation() or patched
     patched = patch_adaln_projection_cache() or patched
     patched = patch_denoise_branch_timestep_rows() or patched
