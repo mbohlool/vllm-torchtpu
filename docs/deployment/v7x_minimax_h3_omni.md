@@ -155,7 +155,7 @@ For each pipeline `<name>` the scripts write to `minimax_h3_outputs/`:
 
 ## 6. Results (`MiniMaxAI/MiniMax-H3` on TPU v7x, `tpu7x-8`)
 
-All numbers were measured with the released `MiniMaxAI/MiniMax-H3` checkpoint on one TPU v7x host (`tpu7x-8`, 8 logical TPU devices), `vllm-omni` commit `e1d77a3`, `t2va`, `seed=42`, `flow_shift=12.0`, `audio_flow_shift=3.0`.
+In the first two subsections below, all numbers were measured with the released `MiniMaxAI/MiniMax-H3` checkpoint on one TPU v7x host (`tpu7x-8`, 8 logical TPU devices), `vllm-omni` commit `e1d77a3`, `t2va`, `seed=42`, `flow_shift=12.0`, `audio_flow_shift=3.0`.
 
 ### Example scripts on this branch
 
@@ -195,6 +195,25 @@ Measured with a benchmark harness around `AsyncOmni` that sends the same request
 | `768x768`, 5 s | `64.85 s` | `38.81 s` (`0.740 s/step`) | `27.33 s` |
 
 On this branch requests 2 and 3 return bit-identical frames. Before, the second request at `256x256` still recompiled its first two steps (its third request took `2.78 s`). `TP2xU4` and `TP8` frames differ by rounding (8 steps: `28.4` / `25.4` / `25.5 dB` PSNR at `480x480x4s` / `768x768x5s` / `768x768x10s`).
+
+### End-to-end comparison with a standalone torch-tpu server
+
+This table compares the full MiniMax-H3 pipeline on `vllm-torchtpu` (real weights, dense attention, `tpu7x-8`: 4 chips, 8 TensorCores) with a standalone `torch-tpu` server at `TP8`. Each request generates 124 frames at 24 fps, and each `vllm-torchtpu` number is the mean of warm requests 2 and 3.
+
+| Resolution & steps | Setup | DiT `s/step` | Denoise | End-to-end | Step speedup | End-to-end speedup |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `512x288`, 20 steps | Standalone server, `TP8` | `0.217` | `4.12 s` | `8.40 s` | — | — |
+| | `vllm-torchtpu`, `TP8` | `0.200` | `3.99 s` | `6.99 s` | `1.09x` | `1.20x` |
+| | `vllm-torchtpu`, `TP2xU4` | `0.124` | `2.48 s` | `5.49 s` | `1.75x` | `1.53x` |
+| `1344x768`, 20 steps | Standalone server, `TP8` | `2.066` | `39.25 s` | `52.05 s` | — | — |
+| | `vllm-torchtpu`, `TP8` | `1.533` | `30.67 s` | `34.31 s` | `1.35x` | `1.52x` |
+| | `vllm-torchtpu`, `TP2xU4` | `1.131` | `22.63 s` | `26.29 s` | `1.83x` | `1.98x` |
+| `1344x768`, 50 steps | Standalone server, `TP8` | `2.266` | `123.09 s` | `135.90 s` | — | — |
+| | `vllm-torchtpu`, `TP8` | `1.530` | `76.49 s` | `80.08 s` | `1.48x` | `1.70x` |
+| | `vllm-torchtpu`, `TP2xU4` | `1.124` | `56.22 s` | `59.86 s` | `2.02x` | `2.27x` |
+
+- The standalone server was not re-run. Its numbers come from its README, measured on the same hardware type.
+- The standalone server syncs after every step and `vllm-torchtpu` does not. At `1344x768` the progress-bar step rate matches the measured step time, so the speedup there is real. At `512x288`, part of the small `TP8` gain may come from the different sync pattern.
 
 ---
 
